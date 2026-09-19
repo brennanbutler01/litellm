@@ -676,10 +676,9 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         even when the global flag is off. Caches the system prompt and the
         trailing turn, so the stable prefix (system + tools + history) is
         reused while the breakpoint advances with the conversation. Returns []
-        (stand down) when neither flag is on, the provider does not consume
-        cache_control breakpoints (only anthropic / bedrock do), the model
-        lacks prompt-caching support, or the request already carries
-        client-supplied cache_control.
+        (stand down) when neither flag is on, the model is not Claude on a
+        supported explicit-cache transport, the model lacks prompt-caching
+        support, or the request already carries client-supplied cache_control.
         """
         import litellm
 
@@ -697,7 +696,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
             except Exception:  # noqa: BLE001  # unroutable model must never block the call, just skip auto-caching
                 return []
 
-        if provider not in ("anthropic", "bedrock"):
+        if provider not in ("anthropic", "bedrock", "vertex_ai", "azure_ai") or "claude" not in model.lower():
             return []
 
         from litellm.utils import supports_prompt_caching

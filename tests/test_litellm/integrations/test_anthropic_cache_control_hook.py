@@ -1595,6 +1595,101 @@ class TestEnableAnthropicPromptCaching:
         assert supports_prompt_caching(model=model, custom_llm_provider=provider) is True
         assert self._points(model=model, provider=provider) == []
 
+    @pytest.mark.parametrize("family", ["haiku-4-5", "sonnet-5", "opus-5", "fable-5", "fable-5-1"])
+    @pytest.mark.parametrize(
+        "provider, template",
+        [("anthropic", "{}"), ("vertex_ai", "{}"), ("azure_ai", "{}"), ("bedrock", "us.anthropic.{}-v1:0")],
+    )
+    @pytest.mark.parametrize("infer_provider", [False, True])
+    @pytest.mark.parametrize("supported", [False, True])
+    def test_claude_transport_defaults(self, monkeypatch, local_model_cost_map, family, provider, template, infer_provider, supported):
+        from litellm.utils import supports_prompt_caching
+
+        model = template.format(f"claude-{family}")
+        qualified = f"{provider}/{model}"
+        entry = {"litellm_provider": provider, "mode": "chat", "supports_prompt_caching": supported}
+        monkeypatch.setitem(litellm.model_cost, model, entry)
+        monkeypatch.setitem(litellm.model_cost, qualified, entry)
+        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", False)
+        target = qualified if infer_provider else model
+        resolved_provider = None if infer_provider else provider
+        assert supports_prompt_caching(model=target, custom_llm_provider=resolved_provider) is supported
+        points = AnthropicCacheControlHook.get_default_injection_points(
+            messages=copy.deepcopy(self.MESSAGES), system=None, model=target,
+            custom_llm_provider=resolved_provider, enable_prompt_caching=True,
+        )
+        assert [point["index"] for point in points] == ([None, -1] if supported else [])
+        affinity_messages = AnthropicCacheControlHook.messages_with_default_injections(
+            copy.deepcopy(self.MESSAGES), models=[qualified], enable_prompt_caching=True,
+        )
+        assert sum(AnthropicCacheControlHook._count_cache_control_blocks(m) for m in affinity_messages) == (2 if supported else 0)
+
+    @pytest.mark.parametrize(
+        "provider, model",
+        [
+            ("bedrock", "us.openai.gpt-6-astra"),
+            ("bedrock", "amazon.nova-pro-v1:0"),
+            ("bedrock", "us.xai.grok-4.6"),
+            ("bedrock", "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opaque"),
+            ("vertex_ai", "gemini-3.8-flash"),
+            ("azure_ai", "gpt-6-astra"),
+            ("anthropic", "unknown-model"),
+        ],
+    )
+    def test_non_claude_caching_capability_does_not_enable_defaults(self, monkeypatch, local_model_cost_map, provider, model):
+        from litellm.utils import supports_prompt_caching
+
+        qualified = f"{provider}/{model}"
+        entry = {"litellm_provider": provider, "mode": "chat", "supports_prompt_caching": True}
+        monkeypatch.setitem(litellm.model_cost, model, entry)
+        monkeypatch.setitem(litellm.model_cost, qualified, entry)
+        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
+        assert supports_prompt_caching(model=model, custom_llm_provider=provider)
+        assert self._points(model=model, provider=provider) == []
+        assert self._points(model=qualified, provider=None) == []
+        assert AnthropicCacheControlHook.messages_with_default_injections(self.MESSAGES, [qualified]) == self.MESSAGES
+
+    @pytest.mark.parametrize("provider", ["vertex_ai", "azure_ai"])
+    @pytest.mark.parametrize("client_control", ["none", "message", "system", "tool", "function", "top_level"])
+    def test_new_transports_preserve_client_controls(self, monkeypatch, local_model_cost_map, provider, client_control):
+        from litellm.llms.vertex_ai.vertex_ai_partner_models.anthropic.transformation import VertexAIAnthropicConfig
+
+        model = "claude-sonnet-5"
+        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
+        monkeypatch.setitem(litellm.model_cost, f"{provider}/{model}", {
+            **litellm.model_cost[f"{provider}/{model}"], "supports_prompt_caching": True,
+        })
+        control = {"type": "ephemeral"}
+        messages = [{"role": "user", "content": [{"type": "text", "text": "question", **({"cache_control": control} if client_control == "message" else {})}]}]
+        system = [{"type": "text", "text": "stable context", **({"cache_control": control} if client_control == "system" else {})}]
+        tools = [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object", "properties": {}}, **({"cache_control": control} if client_control == "tool" else {})}]
+        if client_control == "function":
+            tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}, "cache_control": control}}]
+        kwargs = {"metadata": {}, "model_info": {"id": "selected-deployment"}, **({"cache_control": control} if client_control == "top_level" else {})}
+        original = copy.deepcopy((messages, system, tools))
+        result_messages, result_system = AnthropicCacheControlHook.maybe_inject_cache_control(
+            messages, system, kwargs, model, provider, tools=tools,
+        )
+        if client_control != "none":
+            assert (result_messages, result_system, tools) == original
+            assert kwargs["metadata"] == {}
+        else:
+            assert kwargs["metadata"]["litellm_gateway_injected_cache"] == "selected-deployment"
+            assert sum(AnthropicCacheControlHook._count_cache_control_blocks(m) for m in result_messages) == 1
+            assert result_system[0]["cache_control"] == control
+            if provider == "vertex_ai":
+                wire = VertexAIAnthropicConfig().transform_request(
+                    model=model, messages=[{"role": "system", "content": result_system}, *result_messages],
+                    optional_params={"max_tokens": 8}, litellm_params={}, headers={},
+                )
+                assert wire["system"][0]["cache_control"] == control
+                assert wire["messages"][-1]["content"][-1]["cache_control"] == control
+        seeded = copy.deepcopy(kwargs)
+        AnthropicCacheControlHook.maybe_seed_default_injection_points(
+            seeded, [{"role": "system", "content": original[1]}, *original[0]], model, provider, tools=tools,
+        )
+        assert bool(seeded.get("cache_control_injection_points")) == (client_control == "none")
+
     def test_databricks_claude_not_injected_despite_caching_support(self, monkeypatch, local_model_cost_map):
         from litellm.utils import supports_prompt_caching
 
